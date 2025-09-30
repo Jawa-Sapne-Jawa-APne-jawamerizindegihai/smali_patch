@@ -20,6 +20,29 @@ SUCCESS: Replaced method in target/smali/com/example/PackageVerification.smali
 
 There is a example .smalipatch file for you !!
 _________________________________________________________
-Check the apk_signature_disable.smalipatch as example  
+Check the apk_signature_disable.smalipatch and systemui_mods for deep understanding as example  
 __________________________________________________________
 Happy Modding ;D
+
+USAGE in .smalipatch file
+
+FILE <target_smali_file_path>
+<ACTION_TYPE> <optional_parameters>
+...patch content...
+END
+
+
+FILE smali/com/android/server/SystemServer.smali
+REPLACE .method public static methodOne
+...new method content...
+.end method
+END
+
+FILE smali/com/android/server/SystemServer.smalii
+PATCH .method private methodTwo
+    existing line 1
+    existing line 2
+-   line to remove
++   line to add
+    existing line 3
+END
