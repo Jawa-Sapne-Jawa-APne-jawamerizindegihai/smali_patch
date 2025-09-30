@@ -388,7 +388,8 @@ def show_diff(original, modified):
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: smalipatch.py <work_dir> <patch_file>")
+        print("smalipatcher | A utility tool to reverse engineer apk/jar .dex files | By SameerAlSahab") 
+        print("Usage: smalipatch <work_dir> <patch_file>")
         sys.exit(1)
     
     work_dir = sys.argv[1]
