@@ -1,13 +1,14 @@
 Prerequisites
-This script requires Python 3.
+This script requires Python 3 or the linux executable binary file in releases
 
-#!/usr/bin/env python3
+
 
 Usage
 
 The script is executed via the command line and requires two arguments: the working directory (root of the decompiled APK) and the patch file.
 
 python3 smalipatch.py <work_dir> <patch_file.smalipatch>
+or smalipatch <work_dir> <patch_file.smalipatch>  #exec file in releases
 
 Example Execution
 If your disassembled application files are located in apk_unpacked/ and your patch is in a subdirectory:
