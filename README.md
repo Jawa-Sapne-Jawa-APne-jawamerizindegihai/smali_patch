@@ -33,16 +33,27 @@ END
 
 
 FILE smali/com/android/server/SystemServer.smali
+
 REPLACE .method public static methodOne
+
 ...new method content...
+
 .end method
+
 END
 
-FILE smali/com/android/server/SystemServer.smalii
+FILE smali/com/android/server/SystemServer.smali
+
 PATCH .method private methodTwo
+
     existing line 1
+    
     existing line 2
+    
 -   line to remove
+   
 +   line to add
+  
     existing line 3
+    
 END
