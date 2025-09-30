@@ -57,17 +57,17 @@ def apply_smalipatch(work_dir: str, patch_file: str, stop_on_fail: bool) -> bool
 
     success_count = 0
     total_patches = len(patches)
-    logging.info(f"Found {total_patches} patch(es) to process.")
+    logging.info(f"Found {total_patches} patch definition(s) across file(s).")
 
     for i, patch in enumerate(patches):
         logging.info("-" * 40)
-        logging.info(f"Applying patch {i+1}/{total_patches} for file '{patch['file_path']}'...")
+        logging.info(f"Processing file {i+1}/{total_patches}: '{patch['file_path']}' ({len(patch['actions'])} action(s))...")
         result = apply_single_patch(work_dir, patch)
         if result == "applied":
             success_count += 1
-            logging.info("✓ Patch applied successfully.")
+            logging.info("✓ All actions for this file applied successfully.")
         elif result == "skipped":
-            logging.info("✓ Patch already applied or no changes needed, skipping.")
+            logging.info("✓ All actions for this file already applied or no changes needed, skipping.")
             success_count += 1
         else: # Covers "failed" and "hunk_failed"
             if stop_on_fail:
@@ -75,7 +75,7 @@ def apply_smalipatch(work_dir: str, patch_file: str, stop_on_fail: bool) -> bool
                 return False
 
     logging.info("=" * 40)
-    final_message = f"Final result: {success_count}/{total_patches} patches processed successfully."
+    final_message = f"Final result: {success_count}/{total_patches} file(s) processed successfully."
     if success_count < total_patches:
         final_message += f" ({total_patches - success_count} failed)."
     logging.info(final_message)
@@ -85,12 +85,7 @@ def apply_smalipatch(work_dir: str, patch_file: str, stop_on_fail: bool) -> bool
 def parse_patches(lines: List[str]) -> List[Patch]:
     """
     Parses the text lines from a .smalipatch file into a structured list of patches.
-
-    Args:
-        lines: A list of strings from the patch file.
-
-    Returns:
-        A list of patch objects, where each object represents the actions for one file.
+    This version correctly handles multiple actions per FILE block.
     """
     patches: List[Patch] = []
     current_patch: Optional[Patch] = None
@@ -108,12 +103,12 @@ def parse_patches(lines: List[str]) -> List[Patch]:
             }
             i += 1
         elif line == 'END' and current_patch:
-            patches.append(current_patch)
-            current_patch = None
+            # END now just acts as an optional terminator, the loop will continue
             i += 1
         elif current_patch:
             if line.startswith('REPLACE '):
                 header = line[8:].strip()
+                # The read function now correctly stops at the next action keyword
                 content_lines, i = read_block_content(lines, i + 1)
                 current_patch['actions'].append({
                     'type': 'REPLACE',
@@ -141,19 +136,23 @@ def parse_patches(lines: List[str]) -> List[Patch]:
     return patches
 
 def read_block_content(lines: List[str], start_index: int) -> Tuple[List[str], int]:
-    """Reads content for an action (like REPLACE) until a terminator is found."""
+    """Reads content for an action until a terminator or the next action keyword is found."""
     content = []
     i = start_index
     while i < len(lines):
         line_strip = lines[i].strip()
+        # Stop if we hit a terminator OR the start of a new action/file
         if line_strip == 'END' or any(line_strip.startswith(kw) for kw in ['REPLACE ', 'PATCH ', 'FILE ']):
             break
         content.append(lines[i])
         i += 1
+    # If we stopped at END, consume it
+    if i < len(lines) and lines[i].strip() == 'END':
+        i += 1
     return content, i
 
 def read_patch_operations(lines: List[str], start_index: int) -> Tuple[List[PatchOperation], int]:
-    """Reads +/-/  lines for a PATCH action."""
+    """Reads +/-/ lines for a PATCH action until a terminator or the next action."""
     operations: List[PatchOperation] = []
     i = start_index
     while i < len(lines):
@@ -169,13 +168,16 @@ def read_patch_operations(lines: List[str], start_index: int) -> Tuple[List[Patc
         else:
             operations.append((' ', line))
         i += 1
+    # If we stopped at END, consume it
+    if i < len(lines) and lines[i].strip() == 'END':
+        i += 1
     return operations, i
 
 
 def apply_single_patch(work_dir: str, patch: Patch) -> ApplyResult:
     """
-    Applies a single patch definition to its target file. This is a two-pass
-    operation: first a dry run to validate changes, then the actual write.
+    Applies all actions for a single file. If any action fails, the entire
+    file is considered failed and the original content is kept.
     """
     file_path = patch['file_path']
     full_path = os.path.join(work_dir, file_path)
@@ -191,28 +193,28 @@ def apply_single_patch(work_dir: str, patch: Patch) -> ApplyResult:
         logging.error(f"✗ Patch Failed: Could not read target file {full_path}: {e}")
         return "failed"
 
-    # Apply changes to a copy to see if they are valid
     modified_lines = original_lines.copy()
-    any_hunk_failed = False
-    for action in patch['actions']:
+    
+    for j, action in enumerate(patch['actions']):
+        action_type = action.get('type', 'Unknown')
+        logging.info(f"--> Applying action {j+1}/{len(patch['actions'])} ({action_type})...")
+        
         if action['type'] == 'REPLACE':
             result = apply_replace_action(modified_lines, action)
         elif action['type'] == 'PATCH':
             result = apply_patch_action(modified_lines, action)
+        else:
+            result = None # Should not happen with current parser
         
         if result is None:
-            any_hunk_failed = True
-            break
+            # A specific hunk failed. The whole file patch fails.
+            return "hunk_failed"
         modified_lines = result
-
-    if any_hunk_failed:
-        # Specific error messages are now printed inside the apply_* functions
-        return "hunk_failed"
 
     if original_lines == modified_lines:
         return "skipped"
 
-    # If we are here, the patch is valid and changes are needed.
+    # If we are here, all actions were valid and changes are needed.
     show_diff(original_lines, modified_lines, file_path)
     
     try:
@@ -410,4 +412,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
