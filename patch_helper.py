@@ -3,7 +3,7 @@ Patch Helper for Smalipatcher.
 
 This module contains the core logic for parsing patch files and applying
 the various patch actions (REPLACE, PATCH, CREATE, CREATE_METHOD).
-It also includes the logic for the "non-strict" matching mode.
+It now includes flexible matching that uses method names and ignores spacing.
 """
 
 import os
@@ -12,14 +12,17 @@ import logging
 import difflib
 from typing import List, Dict, Tuple, Optional, Literal
 
+
 # --- Type Aliases ---
 PatchOperation = Tuple[Literal['+', '-', ' '], str]
 PatchAction = Dict[str, any]
 Patch = Dict[str, any]
 ApplyResult = Literal["applied", "created", "skipped", "failed", "hunk_failed"]
 
+
 # --- Constants ---
 ACTION_KEYWORDS = ['REPLACE ', 'PATCH', 'CREATE_METHOD', 'FILE ', 'CREATE ']
+
 
 # --- Parsing Logic ---
 
@@ -85,6 +88,7 @@ def parse_patches(lines: List[str]) -> List[Patch]:
 
     return patches
 
+
 def read_block_content(lines: List[str], start_index: int) -> Tuple[List[str], int]:
     """Reads content for an action until a terminator or the next action keyword is found."""
     content = []
@@ -106,6 +110,7 @@ def read_block_content(lines: List[str], start_index: int) -> Tuple[List[str], i
     if i < len(lines) and lines[i].strip() == 'END':
         i += 1
     return content, i
+
 
 def read_patch_operations(lines: List[str], start_index: int) -> Tuple[List[PatchOperation], int]:
     """Reads +/-/ lines for a PATCH action until a terminator or the next action."""
@@ -136,6 +141,7 @@ def read_patch_operations(lines: List[str], start_index: int) -> Tuple[List[Patc
         i += 1
     return operations, i
 
+
 # --- File and Patch Application ---
 
 def apply_create_action(work_dir: str, patch: Patch) -> ApplyResult:
@@ -156,6 +162,7 @@ def apply_create_action(work_dir: str, patch: Patch) -> ApplyResult:
     except IOError as e:
         logging.error(f"✗ Create Failed: Could not write to target file {full_path}: {e}")
         return "failed"
+
 
 def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResult:
     """
@@ -185,7 +192,7 @@ def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResu
         if action['type'] == 'REPLACE':
             result = _apply_replace(modified_lines, action)
         elif action['type'] == 'PATCH':
-            result = _apply_patch(modified_lines, action, non_strict)
+            result = _apply_patch_flexible(modified_lines, action)
         elif action['type'] == 'CREATE_METHOD':
             result = _apply_create_method(modified_lines, action)
         
@@ -208,6 +215,7 @@ def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResu
         
     return "applied"
 
+
 # --- Specific Action Implementations ---
 
 def _apply_replace(lines: List[str], action: PatchAction) -> Optional[List[str]]:
@@ -220,6 +228,7 @@ def _apply_replace(lines: List[str], action: PatchAction) -> Optional[List[str]]
         return None
     
     return lines[:start_idx + 1] + action['content'] + lines[end_idx:]
+
 
 def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List[str]]:
     """Appends a new method to the end of the file."""
@@ -243,53 +252,92 @@ def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List
     logging.info(f"  -> Inserting new method before line {insert_pos + 1}")
     return lines[:insert_pos] + new_content + lines[insert_pos:]
 
-def _apply_patch(lines: List[str], action: PatchAction, non_strict: bool) -> Optional[List[str]]:
-    """Applies a diff-style patch action."""
+
+def _apply_patch_flexible(lines: List[str], action: PatchAction) -> Optional[List[str]]:
+    """
+    NEW FLEXIBLE PATCH: Searches for method by name, then applies modifications
+    ignoring spacing and focusing on content.
+    """
     operations = action['operations']
     method_sig = action.get('method_sig')
     
-    patch_context_clean = [line.strip() for op, line in operations if op == ' ' and line.strip()]
-    if not patch_context_clean:
-        logging.error("✗ Hunk Failed: PATCH action must contain at least one non-empty context line.")
-        return None
-
-    # Determine the search area (whole file or specific method)
-    search_lines, search_map, search_offset = clean_and_map_lines(lines)
+    # Extract the search pattern from the first context line
+    search_pattern = None
+    for op, line in operations:
+        if op == ' ' and line.strip():
+            search_pattern = line.strip()
+            break
     
-    if method_sig:
-        pattern = method_sig_to_regex(method_sig)
-        method_start_clean, method_end_clean = find_method_range(search_lines, pattern, is_clean=True)
-        if method_start_clean == -1:
-            logging.error(f"✗ Hunk Failed: Method for PATCH not found: {method_sig}")
-            return None
-        search_lines = search_lines[method_start_clean : method_end_clean + 1]
-        search_map = search_map[method_start_clean : method_end_clean + 1]
-        search_offset = method_start_clean
-
-    context_start_idx = find_context(search_lines, patch_context_clean, non_strict)
-    if context_start_idx == -1:
-        logging.error("✗ Hunk Failed: Patch context not found. The code may have changed.")
+    if not search_pattern:
+        logging.error("✗ Hunk Failed: No search pattern found in PATCH operations")
         return None
     
-    # Translate the match in 'clean' lines back to original line indices
-    actual_start_idx_in_clean_lines = context_start_idx + search_offset
+    logging.info(f"  -> Searching for pattern: '{search_pattern}'")
     
-    # Determine the slice of original lines to be replaced
-    original_start_line = search_map[actual_start_idx_in_clean_lines]
+    # Find all potential locations
+    potential_starts = []
+    for i, line in enumerate(lines):
+        if search_pattern in line:
+            potential_starts.append(i)
     
-    context_lines_to_remove = [line for op, line in operations if op in (' ', '-')]
-    removed_clean_count = len([line.strip() for line in context_lines_to_remove if line.strip()])
+    if not potential_starts:
+        logging.error(f"✗ Hunk Failed: Search pattern '{search_pattern}' not found in file")
+        return None
     
-    # Find the end of the hunk in the original file
-    next_clean_line_idx = actual_start_idx_in_clean_lines + removed_clean_count
-    if next_clean_line_idx < len(search_map) + search_offset:
-         original_end_line = search_map[next_clean_line_idx]
-    else: # Hunk goes to the very end
-         original_end_line = len(lines)
+    # Try each potential location
+    for start_idx in potential_starts:
+        result = _try_apply_at_location(lines, start_idx, operations)
+        if result is not None:
+            logging.info(f"  -> Successfully applied at line {start_idx + 1}")
+            return result
+    
+    logging.error("✗ Hunk Failed: Could not apply patch at any matching location")
+    return None
 
-    # Reconstruct the file content
-    new_hunk_lines = [line for op, line in operations if op in (' ', '+')]
-    return lines[:original_start_line] + new_hunk_lines + lines[original_end_line:]
+
+def _try_apply_at_location(lines: List[str], start_idx: int, operations: List[PatchOperation]) -> Optional[List[str]]:
+    """
+    Try to apply patch operations starting at the given location.
+    Returns modified lines if successful, None if failed.
+    """
+    current_idx = start_idx
+    modified_lines = lines[:]
+    ops_applied = 0
+    
+    for op, content in operations:
+        content_stripped = content.strip()
+        
+        if op == ' ':  # Context line - must match
+            if current_idx >= len(modified_lines):
+                return None
+            current_line_stripped = modified_lines[current_idx].strip()
+            if content_stripped != current_line_stripped:
+                return None
+            current_idx += 1
+            ops_applied += 1
+            
+        elif op == '-':  # Delete line
+            if current_idx >= len(modified_lines):
+                return None
+            current_line_stripped = modified_lines[current_idx].strip()
+            if content_stripped != current_line_stripped:
+                return None
+            # Remove the line
+            modified_lines = modified_lines[:current_idx] + modified_lines[current_idx + 1:]
+            ops_applied += 1
+            # Don't increment current_idx because we removed a line
+            
+        elif op == '+':  # Add line
+            modified_lines = modified_lines[:current_idx] + [content] + modified_lines[current_idx:]
+            current_idx += 1
+            ops_applied += 1
+    
+    # If we applied at least one operation, consider it successful
+    if ops_applied > 0:
+        return modified_lines
+    
+    return None
+
 
 # --- Utility Functions ---
 
@@ -307,10 +355,12 @@ def clean_and_map_lines(lines: List[str]) -> Tuple[List[str], List[int], int]:
             mapping.append(i)
     return clean_lines, mapping, 0
 
+
 def method_sig_to_regex(method_sig: str) -> re.Pattern:
     """Converts a method signature string into a compiled regex pattern."""
     escaped = re.escape(method_sig).replace(r'\ ', r'\s+')
     return re.compile(f'^{escaped}')
+
 
 def find_method_range(lines: List[str], pattern: re.Pattern, is_clean: bool = False) -> Tuple[int, int]:
     """Finds the start and end line indices of a method block."""
@@ -324,36 +374,6 @@ def find_method_range(lines: List[str], pattern: re.Pattern, is_clean: bool = Fa
             return i, -1 # Found start but not end
     return -1, -1
 
-def line_to_non_strict_regex(line: str) -> re.Pattern:
-    """Converts a smali line into a regex that ignores v/p register numbers."""
-    # Escape special regex characters
-    line = re.escape(line)
-    # Replace escaped p# and v# with a regex for p/v followed by digits
-    line = re.sub(r'([vp])\\\d+', r'\1\\d+', line)
-    return re.compile(line)
-
-def find_context(search_lines: List[str], context_lines: List[str], non_strict: bool) -> int:
-    """Finds the starting index of a sequence of context lines."""
-    if not context_lines: return -1
-    
-    if not non_strict:
-        # Strict mode: simple list slicing check for performance
-        for i in range(len(search_lines) - len(context_lines) + 1):
-            if search_lines[i:i+len(context_lines)] == context_lines:
-                return i
-    else:
-        # Non-strict mode: use regex matching
-        context_regexes = [line_to_non_strict_regex(line) for line in context_lines]
-        for i in range(len(search_lines) - len(context_lines) + 1):
-            matched = True
-            for k, regex in enumerate(context_regexes):
-                if not regex.fullmatch(search_lines[i+k]):
-                    matched = False
-                    break
-            if matched:
-                return i
-                
-    return -1
 
 def show_diff(original: List[str], modified: List[str], filename: str):
     """Displays a user-friendly, unified diff of the changes."""
@@ -375,4 +395,3 @@ def show_diff(original: List[str], modified: List[str], filename: str):
             else:
                 logging.info(line)
     logging.info("------------------------------------")
-
