@@ -14,7 +14,7 @@ import argparse
 from typing import List
 
 # Import core logic from the helper script
-import patch_helper
+import helper
 
 def setup_logging():
     """Sets up a simple logging configuration to print messages to stdout."""
