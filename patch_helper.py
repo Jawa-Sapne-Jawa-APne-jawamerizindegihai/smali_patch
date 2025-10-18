@@ -19,7 +19,7 @@ Patch = Dict[str, any]
 ApplyResult = Literal["applied", "created", "skipped", "failed", "hunk_failed"]
 
 # --- Constants ---
-ACTION_KEYWORDS = ['REPLACE ', 'PATCH ', 'CREATE_METHOD', 'FILE ', 'CREATE ']
+ACTION_KEYWORDS = ['REPLACE ', 'PATCH', 'CREATE_METHOD', 'FILE ', 'CREATE ']
 
 # --- Parsing Logic ---
 
@@ -62,8 +62,8 @@ def parse_patches(lines: List[str]) -> List[Patch]:
                 current_patch['actions'].append({
                     'type': 'REPLACE', 'method_sig': header, 'content': content_lines
                 })
-            elif line.startswith('PATCH '):
-                header = line[6:].strip()
+            elif line.strip() == 'PATCH' or line.startswith('PATCH '):
+                header = line[len('PATCH'):].strip()
                 operations, i = read_patch_operations(lines, i + 1)
                 current_patch['actions'].append({
                     'type': 'PATCH',
@@ -91,7 +91,15 @@ def read_block_content(lines: List[str], start_index: int) -> Tuple[List[str], i
     i = start_index
     while i < len(lines):
         line_strip = lines[i].strip()
-        if line_strip == 'END' or any(line_strip.startswith(kw) for kw in ACTION_KEYWORDS):
+
+        is_keyword = False
+        for kw in ACTION_KEYWORDS:
+            kw_no_space = kw.strip()
+            if line_strip == kw_no_space or line_strip.startswith(kw.strip() + ' '):
+                is_keyword = True
+                break
+        
+        if line_strip == 'END' or is_keyword:
             break
         content.append(lines[i])
         i += 1
@@ -106,7 +114,15 @@ def read_patch_operations(lines: List[str], start_index: int) -> Tuple[List[Patc
     while i < len(lines):
         line = lines[i]
         line_strip = line.strip()
-        if line_strip == 'END' or any(line_strip.startswith(kw) for kw in ACTION_KEYWORDS):
+
+        is_keyword = False
+        for kw in ACTION_KEYWORDS:
+            kw_no_space = kw.strip()
+            if line_strip == kw_no_space or line_strip.startswith(kw.strip() + ' '):
+                is_keyword = True
+                break
+
+        if line_strip == 'END' or is_keyword:
             break
         
         if line.startswith('+ '):
@@ -359,3 +375,4 @@ def show_diff(original: List[str], modified: List[str], filename: str):
             else:
                 logging.info(line)
     logging.info("------------------------------------")
+
