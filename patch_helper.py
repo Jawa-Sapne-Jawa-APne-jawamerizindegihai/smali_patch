@@ -299,6 +299,9 @@ def _try_apply_at_location(lines: List[str], start_idx: int, operations: List[Pa
     """
     Try to apply patch operations starting at the given location.
     Returns modified lines if successful, None if failed.
+    
+    V2: Now ignores blank lines in context (' ') and delete ('-') operations
+        to be robust against whitespace-only differences.
     """
     current_idx = start_idx
     modified_lines = lines[:]
@@ -306,6 +309,21 @@ def _try_apply_at_location(lines: List[str], start_idx: int, operations: List[Pa
     
     for op, content in operations:
         content_stripped = content.strip()
+        
+        # --- NEW FIX ---
+        # If the patch line is just whitespace, be flexible.
+        if not content_stripped:
+            if op == '+': 
+                # If it's an ADD, we still need to add the blank line
+                modified_lines = modified_lines[:current_idx] + [content] + modified_lines[current_idx:]
+                current_idx += 1
+                ops_applied += 1
+            
+            # If op is ' ' or '-', just skip this operation.
+            # We don't fail, we just assume the blank line
+            # wasn't important for matching.
+            continue
+        # --- END NEW FIX ---
         
         if op == ' ':  # Context line - must match
             if current_idx >= len(modified_lines):
@@ -337,7 +355,6 @@ def _try_apply_at_location(lines: List[str], start_idx: int, operations: List[Pa
         return modified_lines
     
     return None
-
 
 # --- Utility Functions ---
 
