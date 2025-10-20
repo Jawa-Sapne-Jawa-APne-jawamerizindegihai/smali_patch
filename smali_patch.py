@@ -3,8 +3,10 @@
 Smalipatcher: A utility tool to apply patches to smali files.
 
 This script reads a custom .smalipatch file format and applies the specified
-changes to a directory of smali code, typically extracted from an APK.
-It now supports creating new files and methods, and a non-strict matching mode.
+changes to a directory of smali code.
+
+This updated version uses a more robust patch helper that ignores
+directives, whitespace, and (optionally) register numbers.
 """
 
 import os
@@ -18,6 +20,14 @@ import patch_helper
 
 def setup_logging():
     """Sets up a simple logging configuration to print messages to stdout."""
+    # Add color support for Windows
+    if os.name == 'nt':
+        try:
+            import colorama
+            colorama.init()
+        except ImportError:
+            pass
+            
     logging.basicConfig(
         format='%(message)s',
         level=logging.INFO
@@ -61,12 +71,12 @@ def apply_smalipatch(work_dir: str, patch_file: str, stop_on_fail: bool, non_str
 
     for i, patch in enumerate(patches):
         logging.info("-" * 40)
-        patch_type = patch.get('type', 'FILE') # Default to 'FILE' for older format
+        patch_type = patch.get('type', 'FILE')
         
         if patch_type == 'CREATE':
             logging.info(f"Processing CREATE {i+1}/{total_patches}: '{patch['file_path']}'...")
             result = patch_helper.apply_create_action(work_dir, patch)
-        else: # This handles FILE patches with actions inside
+        else: # This handles FILE patches
             logging.info(f"Processing FILE {i+1}/{total_patches}: '{patch['file_path']}' ({len(patch['actions'])} action(s))...")
             result = patch_helper.apply_file_patch(work_dir, patch, non_strict)
 
@@ -91,7 +101,7 @@ def apply_smalipatch(work_dir: str, patch_file: str, stop_on_fail: bool, non_str
 def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
-        description="Smalipatcher: A reverse engineering tool for manipulating apk/jar .dex files by @SameerAlSahab",
+        description="Smalipatcher: A reverse engineering tool for manipulating apk/jar .dex files.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Patch file commands:
