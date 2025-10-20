@@ -50,13 +50,13 @@ def normalize(line: str, non_strict: bool = False) -> Optional[str]:
     # 2. Collapse all internal whitespace to a single space
     line = re.sub(r'\s+', ' ', line)
     
-    # 3. Handle non-strict register matching
+    # 3. Handle non-strict register matching - BUT NOT LABELS!
     if non_strict:
-        # Replaces v1, v22, p0, p10 etc. with a generic 'vX' or 'pX'
-        line = re.sub(r'\b([vp])\d+\b', r'\1X', line)
+        # Only replace standalone register names like "v0", "p1" but NOT labels like ":cond_0"
+        # Use lookarounds to ensure we're not inside a label
+        line = re.sub(r'(?<!\:)\b([vp])\d+\b', r'\1X', line)
     
     return line
-
 
 # --- Parsing Logic (Unchanged) ---
 
