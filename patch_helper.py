@@ -3,7 +3,12 @@ Patch Helper for Smalipatcher.
 
 This module contains the core logic for parsing patch files and applying
 the various patch actions (REPLACE, PATCH, CREATE, CREATE_METHOD).
-It now includes flexible matching that uses method names and ignores spacing.
+
+The new PATCH logic is robust to:
+- Whitespace differences
+- .line, .source, #comment, and other directives
+- Blank lines in the patch or target
+- (With --non-strict) v#/p# register number differences
 """
 
 import os
@@ -21,125 +26,143 @@ ApplyResult = Literal["applied", "created", "skipped", "failed", "hunk_failed"]
 
 
 # --- Constants ---
-ACTION_KEYWORDS = ['REPLACE ', 'PATCH', 'CREATE_METHOD', 'FILE ', 'CREATE ']
+# Keywords that terminate a content block
+BLOCK_TERMINATORS = [
+    'FILE ', 'CREATE ', 'REPLACE ', 'PATCH', 'CREATE_METHOD', 'END'
+]
 
 
-# --- Parsing Logic ---
+# --- Robust Normalization Function ---
+
+def normalize(line: str, non_strict: bool = False) -> Optional[str]:
+    """
+    Normalizes a smali line for robust comparison.
+
+    Returns:
+        A normalized string, or None if the line should be skipped entirely.
+    """
+    line = line.strip()
+    
+    # 1. Ignore comments, directives, and empty lines
+    if not line or line.startswith(('.line', '#', '.source', '.prologue', '.epilogue')):
+        return None  # This line is "skippable"
+        
+    # 2. Collapse all internal whitespace to a single space
+    line = re.sub(r'\s+', ' ', line)
+    
+    # 3. Handle non-strict register matching
+    if non_strict:
+        # Replaces v1, v22, p0, p10 etc. with a generic 'vX' or 'pX'
+        line = re.sub(r'\b([vp])\d+\b', r'\1X', line)
+    
+    return line
+
+
+# --- New Parsing Logic ---
 
 def parse_patches(lines: List[str]) -> List[Patch]:
-    """
-    Parses the text lines from a .smalipatch file into a structured list of patches.
-    Handles FILE and CREATE top-level blocks.
-    """
-    patches: List[Patch] = []
-    current_patch: Optional[Patch] = None
+    """Parses text lines into a structured list of patches."""
+    patches = []
     i = 0
-
     while i < len(lines):
         line = lines[i].strip()
-        
         if line.startswith('FILE '):
-            if current_patch: patches.append(current_patch)
-            current_patch = {
-                'type': 'FILE',
-                'file_path': line[5:].strip(),
-                'actions': []
-            }
-            i += 1
+            patch, i = parse_file_block(lines, i)
+            if patch: patches.append(patch)
         elif line.startswith('CREATE '):
-            if current_patch: patches.append(current_patch)
-            content_lines, i_after = read_block_content(lines, i + 1)
-            patches.append({
-                'type': 'CREATE',
-                'file_path': line[7:].strip(),
-                'content': content_lines
-            })
-            i = i_after
-            current_patch = None # CREATE blocks are self-contained
-        elif line == 'END' and current_patch:
-            i += 1 # Ignore END, it's just for readability
-        elif current_patch:
-            if line.startswith('REPLACE '):
-                header = line[8:].strip()
-                content_lines, i = read_block_content(lines, i + 1)
-                current_patch['actions'].append({
-                    'type': 'REPLACE', 'method_sig': header, 'content': content_lines
-                })
-            elif line.strip() == 'PATCH' or line.startswith('PATCH '):
-                header = line[len('PATCH'):].strip()
-                operations, i = read_patch_operations(lines, i + 1)
-                current_patch['actions'].append({
-                    'type': 'PATCH',
-                    'method_sig': header if header and not header.startswith(('+', '-')) else None,
-                    'operations': operations
-                })
-            elif line.startswith('CREATE_METHOD'):
-                content_lines, i = read_block_content(lines, i + 1)
-                current_patch['actions'].append({
-                    'type': 'CREATE_METHOD', 'content': content_lines
-                })
-            else:
-                i += 1 # Ignore empty or unrecognized lines
+            patch, i = parse_create_block(lines, i)
+            if patch: patches.append(patch)
         else:
-            i += 1 # Ignore lines before the first directive
-
-    if current_patch:
-        patches.append(current_patch)
-
+            i += 1  # Skip unknown/empty lines
     return patches
 
 
-def read_block_content(lines: List[str], start_index: int) -> Tuple[List[str], int]:
-    """Reads content for an action until a terminator or the next action keyword is found."""
+def parse_file_block(lines: List[str], start_index: int) -> Tuple[Optional[Patch], int]:
+    """Parses a 'FILE ... END' block."""
+    file_path = lines[start_index].strip()[5:].strip()
+    patch = {'type': 'FILE', 'file_path': file_path, 'actions': []}
+    i = start_index + 1
+    while i < len(lines):
+        line = lines[i].strip()
+        if line == 'END':
+            return patch, i + 1
+        elif line.startswith('REPLACE '):
+            action, i = parse_action_block(lines, i, 'REPLACE')
+            patch['actions'].append(action)
+        elif line.startswith('PATCH'):  # Handles 'PATCH' and 'PATCH <sig>'
+            action, i = parse_action_block(lines, i, 'PATCH')
+            patch['actions'].append(action)
+        elif line == 'CREATE_METHOD':
+            action, i = parse_action_block(lines, i, 'CREATE_METHOD')
+            patch['actions'].append(action)
+        else:
+            i += 1  # Skip empty/unknown lines within FILE block
+    logging.warning(f"Warning: 'FILE {file_path}' block missing 'END' terminator.")
+    return patch, i
+
+
+def parse_create_block(lines: List[str], start_index: int) -> Tuple[Optional[Patch], int]:
+    """Parses a 'CREATE ... END' block."""
+    file_path = lines[start_index].strip()[7:].strip()
+    content, i = read_content_block(lines, start_index + 1)
+    patch = {'type': 'CREATE', 'file_path': file_path, 'content': content}
+    return patch, i
+
+
+def parse_action_block(lines: List[str], start_index: int, action_type: str) -> Tuple[PatchAction, int]:
+    """Parses an action block (REPLACE, PATCH, CREATE_METHOD) and its content."""
+    line = lines[start_index].strip()
+    header = line[len(action_type):].strip()
+    action = {'type': action_type}
+    if header:
+        action['method_sig'] = header
+    
+    content_lines, i = read_content_block(lines, start_index + 1)
+    
+    if action_type == 'PATCH':
+        action['operations'] = parse_patch_operations(content_lines)
+    else:
+        action['content'] = content_lines
+    return action, i
+
+
+def read_content_block(lines: List[str], start_index: int) -> Tuple[List[str], int]:
+    """Reads lines until the next action keyword or END."""
     content = []
     i = start_index
     while i < len(lines):
-        line_strip = lines[i].strip()
-
-        is_keyword = False
-        for kw in ACTION_KEYWORDS:
-            kw_no_space = kw.strip()
-            if line_strip == kw_no_space or line_strip.startswith(kw.strip() + ' '):
-                is_keyword = True
-                break
-        
-        if line_strip == 'END' or is_keyword:
-            break
-        content.append(lines[i])
-        i += 1
-    if i < len(lines) and lines[i].strip() == 'END':
-        i += 1
-    return content, i
-
-
-def read_patch_operations(lines: List[str], start_index: int) -> Tuple[List[PatchOperation], int]:
-    """Reads +/-/ lines for a PATCH action until a terminator or the next action."""
-    operations: List[PatchOperation] = []
-    i = start_index
-    while i < len(lines):
-        line = lines[i]
+        line = lines[i]  # Keep original formatting
         line_strip = line.strip()
-
-        is_keyword = False
-        for kw in ACTION_KEYWORDS:
-            kw_no_space = kw.strip()
-            if line_strip == kw_no_space or line_strip.startswith(kw.strip() + ' '):
-                is_keyword = True
-                break
-
-        if line_strip == 'END' or is_keyword:
-            break
         
+        is_terminator = False
+        for kw in BLOCK_TERMINATORS:
+             if line_strip == kw or line_strip.startswith(kw + ' '):
+                 is_terminator = True
+                 break
+        
+        if is_terminator:
+            # If it's END, consume it. Otherwise, don't.
+            if line_strip == 'END':
+                i += 1
+            return content, i
+        
+        content.append(line)
+        i += 1
+    return content, i  # Reached end of file
+
+
+def parse_patch_operations(lines: List[str]) -> List[PatchOperation]:
+    """Converts content lines into +/-/ operations."""
+    ops = []
+    for line in lines:
         if line.startswith('+ '):
-            operations.append(('+', line[2:]))
+            ops.append(('+', line[2:]))
         elif line.startswith('- '):
-            operations.append(('-', line[2:]))
+            ops.append(('-', line[2:]))
         else:
-            operations.append((' ', line))
-        i += 1
-    if i < len(lines) and lines[i].strip() == 'END':
-        i += 1
-    return operations, i
+            # Keep original line, including leading whitespace, as context
+            ops.append((' ', line))
+    return ops
 
 
 # --- File and Patch Application ---
@@ -165,10 +188,7 @@ def apply_create_action(work_dir: str, patch: Patch) -> ApplyResult:
 
 
 def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResult:
-    """
-    Applies all actions for a single file. If any action fails, the entire
-    file is considered failed, and original content is restored if necessary.
-    """
+    """Applies all actions for a single file."""
     full_path = os.path.join(work_dir, patch['file_path'])
 
     if not os.path.exists(full_path):
@@ -192,12 +212,12 @@ def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResu
         if action['type'] == 'REPLACE':
             result = _apply_replace(modified_lines, action)
         elif action['type'] == 'PATCH':
-            result = _apply_patch_flexible(modified_lines, action)
+            result = _apply_patch(modified_lines, action, non_strict)
         elif action['type'] == 'CREATE_METHOD':
             result = _apply_create_method(modified_lines, action)
         
         if result is None:
-            return "hunk_failed" # A specific hunk failed.
+            return "hunk_failed"  # A specific hunk failed.
         modified_lines = result
 
     if original_lines == modified_lines:
@@ -219,7 +239,7 @@ def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResu
 # --- Specific Action Implementations ---
 
 def _apply_replace(lines: List[str], action: PatchAction) -> Optional[List[str]]:
-    """Replaces the body of a method."""
+    """Replaces the body of a method. (Unchanged from original)."""
     pattern = method_sig_to_regex(action['method_sig'])
     start_idx, end_idx = find_method_range(lines, pattern)
 
@@ -231,9 +251,7 @@ def _apply_replace(lines: List[str], action: PatchAction) -> Optional[List[str]]
 
 
 def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List[str]]:
-    """Appends a new method to the end of the file."""
-    # Find the last occurrence of '.end method' to insert after,
-    # or the '.class' line to insert before if no methods exist.
+    """Appends a new method to the end of the file. (Unchanged from original)."""
     insert_pos = -1
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip().startswith('.end class'):
@@ -244,7 +262,6 @@ def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List
         logging.error("✗ Hunk Failed: Could not find '.end class' directive to insert method before.")
         return None
     
-    # Add an extra newline for spacing if the preceding line isn't empty
     new_content = action['content']
     if lines[insert_pos - 1].strip() != '':
         new_content = [''] + new_content
@@ -253,125 +270,82 @@ def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List
     return lines[:insert_pos] + new_content + lines[insert_pos:]
 
 
-def _apply_patch_flexible(lines: List[str], action: PatchAction) -> Optional[List[str]]:
+def _apply_patch(lines: List[str], action: PatchAction, non_strict: bool) -> Optional[List[str]]:
     """
-    NEW FLEXIBLE PATCH: Searches for method by name, then applies modifications
-    ignoring spacing and focusing on content.
+    Applies a PATCH action using a robust, line-by-line streaming match.
+    This is the new, robust logic.
     """
+    
     operations = action['operations']
-    method_sig = action.get('method_sig')
     
-    # Extract the search pattern from the first context line
-    search_pattern = None
-    for op, line in operations:
-        if op == ' ' and line.strip():
-            search_pattern = line.strip()
-            break
+    target_idx = 0       # Current line in target file
+    op_idx = 0           # Current operation in patch
     
-    if not search_pattern:
-        logging.error("✗ Hunk Failed: No search pattern found in PATCH operations")
-        return None
+    modified_lines = []  # The new list of lines we are building
     
-    logging.info(f"  -> Searching for pattern: '{search_pattern}'")
-    
-    # Find all potential locations
-    potential_starts = []
-    for i, line in enumerate(lines):
-        if search_pattern in line:
-            potential_starts.append(i)
-    
-    if not potential_starts:
-        logging.error(f"✗ Hunk Failed: Search pattern '{search_pattern}' not found in file")
-        return None
-    
-    # Try each potential location
-    for start_idx in potential_starts:
-        result = _try_apply_at_location(lines, start_idx, operations)
-        if result is not None:
-            logging.info(f"  -> Successfully applied at line {start_idx + 1}")
-            return result
-    
-    logging.error("✗ Hunk Failed: Could not apply patch at any matching location")
-    return None
-
-
-def _try_apply_at_location(lines: List[str], start_idx: int, operations: List[PatchOperation]) -> Optional[List[str]]:
-    """
-    Try to apply patch operations starting at the given location.
-    Returns modified lines if successful, None if failed.
-    
-    V2: Now ignores blank lines in context (' ') and delete ('-') operations
-        to be robust against whitespace-only differences.
-    """
-    current_idx = start_idx
-    modified_lines = lines[:]
-    ops_applied = 0
-    
-    for op, content in operations:
-        content_stripped = content.strip()
+    while op_idx < len(operations):
+        op, patch_line = operations[op_idx]
         
-        # --- NEW FIX ---
-        # If the patch line is just whitespace, be flexible.
-        if not content_stripped:
-            if op == '+': 
-                # If it's an ADD, we still need to add the blank line
-                modified_lines = modified_lines[:current_idx] + [content] + modified_lines[current_idx:]
-                current_idx += 1
-                ops_applied += 1
-            
-            # If op is ' ' or '-', just skip this operation.
-            # We don't fail, we just assume the blank line
-            # wasn't important for matching.
+        if op == '+':
+            # ADD: Just add the line to our new list.
+            modified_lines.append(patch_line)
+            op_idx += 1
             continue
-        # --- END NEW FIX ---
         
-        if op == ' ':  # Context line - must match
-            if current_idx >= len(modified_lines):
-                return None
-            current_line_stripped = modified_lines[current_idx].strip()
-            if content_stripped != current_line_stripped:
-                return None
-            current_idx += 1
-            ops_applied += 1
+        # If we are here, op is ' ' or '-'.
+        # We must find a matching line in the target.
+        
+        # 1. Get the next meaningful patch line
+        norm_patch_line = normalize(patch_line, non_strict)
+        
+        # Skip this operation if it's not meaningful (e.g., a comment, .line)
+        if norm_patch_line is None:
+            op_idx += 1
+            continue
+        
+        # 2. Get the next meaningful target line
+        norm_target_line = None
+        while target_idx < len(lines):
+            norm_target_line = normalize(lines[target_idx], non_strict)
+            if norm_target_line is not None:
+                break  # Found a meaningful (non-directive) target line
             
-        elif op == '-':  # Delete line
-            if current_idx >= len(modified_lines):
-                return None
-            current_line_stripped = modified_lines[current_idx].strip()
-            if content_stripped != current_line_stripped:
-                return None
-            # Remove the line
-            modified_lines = modified_lines[:current_idx] + modified_lines[current_idx + 1:]
-            ops_applied += 1
-            # Don't increment current_idx because we removed a line
+            # It was a skippable line, so add it to output and keep scanning
+            modified_lines.append(lines[target_idx])
+            target_idx += 1
+        
+        if target_idx == len(lines):
+            # We ran out of target lines to match against
+            logging.error(f"✗ Hunk Failed: Reached end of file while searching for: '{patch_line.strip()}'")
+            return None
+
+        # 3. We have two meaningful, normalized lines. Compare them.
+        if norm_patch_line != norm_target_line:
+            logging.error(f"✗ Hunk Failed: Mismatch.")
+            logging.error(f"  Expected (normalized): '{norm_patch_line}' (from '{patch_line.strip()}')")
+            logging.error(f"  Got (normalized):      '{norm_target_line}' (from '{lines[target_idx].strip()}' at line {target_idx + 1})")
+            return None
             
-        elif op == '+':  # Add line
-            modified_lines = modified_lines[:current_idx] + [content] + modified_lines[current_idx:]
-            current_idx += 1
-            ops_applied += 1
+        # 4. They match!
+        if op == ' ':
+            # CONTEXT: Add the *original* target line to the output
+            modified_lines.append(lines[target_idx])
+            target_idx += 1
+            op_idx += 1
+        elif op == '-':
+            # DELETE: *Don't* add the target line.
+            # Just advance both pointers.
+            target_idx += 1
+            op_idx += 1
+            
+    # We've applied all patch operations.
+    # Now, append any remaining lines from the original file.
+    modified_lines.extend(lines[target_idx:])
     
-    # If we applied at least one operation, consider it successful
-    if ops_applied > 0:
-        return modified_lines
-    
-    return None
+    return modified_lines
 
-# --- Utility Functions ---
 
-def clean_and_map_lines(lines: List[str]) -> Tuple[List[str], List[int], int]:
-    """
-    Removes comments, .line directives, and empty lines for matching.
-    Returns (clean_lines, mapping_to_original_indices, offset_always_zero).
-    """
-    clean_lines = []
-    mapping = []
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped and not stripped.startswith(('.line ', '#', '.source ')):
-            clean_lines.append(stripped)
-            mapping.append(i)
-    return clean_lines, mapping, 0
-
+# --- Utility Functions (Unchanged) ---
 
 def method_sig_to_regex(method_sig: str) -> re.Pattern:
     """Converts a method signature string into a compiled regex pattern."""
@@ -379,16 +353,16 @@ def method_sig_to_regex(method_sig: str) -> re.Pattern:
     return re.compile(f'^{escaped}')
 
 
-def find_method_range(lines: List[str], pattern: re.Pattern, is_clean: bool = False) -> Tuple[int, int]:
+def find_method_range(lines: List[str], pattern: re.Pattern) -> Tuple[int, int]:
     """Finds the start and end line indices of a method block."""
     for i, line in enumerate(lines):
-        line_to_check = line if is_clean else line.strip()
+        line_to_check = line.strip()
         if pattern.match(line_to_check):
             for j in range(i + 1, len(lines)):
-                line_to_check_end = lines[j] if is_clean else lines[j].strip()
+                line_to_check_end = lines[j].strip()
                 if line_to_check_end == '.end method':
                     return i, j
-            return i, -1 # Found start but not end
+            return i, -1  # Found start but not end
     return -1, -1
 
 
@@ -404,11 +378,11 @@ def show_diff(original: List[str], modified: List[str], filename: str):
     else:
         for line in diff_lines:
             if line.startswith('+'):
-                logging.info(f"\033[92m{line}\033[0m") # Green
+                logging.info(f"\033[92m{line}\033[0m")  # Green
             elif line.startswith('-'):
-                logging.info(f"\033[91m{line}\033[0m") # Red
+                logging.info(f"\033[91m{line}\033[0m")  # Red
             elif line.startswith('@@'):
-                logging.info(f"\033[96m{line}\033[0m") # Cyan
+                logging.info(f"\033[96m{line}\033[0m")  # Cyan
             else:
                 logging.info(line)
     logging.info("------------------------------------")
