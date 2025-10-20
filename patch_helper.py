@@ -423,7 +423,7 @@ def show_diff(original: List[str], modified: List[str], filename: str):
             if line.startswith('+'):
                 logging.info(f"\033[92m{line}\033[0m")  # Green
             elif line.startswith('-'):
-                logging.info(f"\03S[91m{line}\033[0m")  # Red
+                logging.info(f"\033[91m{line}\033[0m")  # Red
             elif line.startswith('@@'):
                 logging.info(f"\033[96m{line}\033[0m")  # Cyan
             else:
