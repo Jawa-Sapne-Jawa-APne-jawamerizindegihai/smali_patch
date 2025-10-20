@@ -58,7 +58,7 @@ def normalize(line: str, non_strict: bool = False) -> Optional[str]:
     return line
 
 
-# --- New Parsing Logic ---
+# --- Parsing Logic (Unchanged) ---
 
 def parse_patches(lines: List[str]) -> List[Patch]:
     """Parses text lines into a structured list of patches."""
@@ -165,7 +165,7 @@ def parse_patch_operations(lines: List[str]) -> List[PatchOperation]:
     return ops
 
 
-# --- File and Patch Application ---
+# --- File and Patch Application (Unchanged) ---
 
 def apply_create_action(work_dir: str, patch: Patch) -> ApplyResult:
     """Creates a new smali file."""
@@ -212,6 +212,7 @@ def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResu
         if action['type'] == 'REPLACE':
             result = _apply_replace(modified_lines, action)
         elif action['type'] == 'PATCH':
+            # This is the corrected function call
             result = _apply_patch(modified_lines, action, non_strict)
         elif action['type'] == 'CREATE_METHOD':
             result = _apply_create_method(modified_lines, action)
@@ -239,7 +240,7 @@ def apply_file_patch(work_dir: str, patch: Patch, non_strict: bool) -> ApplyResu
 # --- Specific Action Implementations ---
 
 def _apply_replace(lines: List[str], action: PatchAction) -> Optional[List[str]]:
-    """Replaces the body of a method. (Unchanged from original)."""
+    """Replaces the body of a method. (Unchanged)."""
     pattern = method_sig_to_regex(action['method_sig'])
     start_idx, end_idx = find_method_range(lines, pattern)
 
@@ -251,7 +252,7 @@ def _apply_replace(lines: List[str], action: PatchAction) -> Optional[List[str]]
 
 
 def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List[str]]:
-    """Appends a new method to the end of the file. (Unchanged from original)."""
+    """Appends a new method to the end of the file. (Unchanged)."""
     insert_pos = -1
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip().startswith('.end class'):
@@ -270,76 +271,118 @@ def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List
     return lines[:insert_pos] + new_content + lines[insert_pos:]
 
 
+# --- [ NEW CORRECTED PATCH FUNCTION ] ---
+
 def _apply_patch(lines: List[str], action: PatchAction, non_strict: bool) -> Optional[List[str]]:
     """
-    Applies a PATCH action using a robust, line-by-line streaming match.
-    This is the new, robust logic.
+    Applies a PATCH action robustly.
+    1. Finds the first meaningful anchor line from the patch.
+    2. Scans the target file to find that anchor.
+    3. Applies the rest of the patch sequentially from that point.
     """
     
     operations = action['operations']
     
-    target_idx = 0       # Current line in target file
-    op_idx = 0           # Current operation in patch
+    # 1. Find the first meaningful context or delete line to anchor on.
+    anchor_op_index = -1
+    norm_anchor_line = None
+    for i, (op, line) in enumerate(operations):
+        if op == ' ' or op == '-': # '+' lines can't be anchors
+            norm_line = normalize(line, non_strict)
+            if norm_line: # Found our anchor
+                anchor_op_index = i
+                norm_anchor_line = norm_line
+                break
     
-    modified_lines = []  # The new list of lines we are building
+    if not norm_anchor_line:
+        # This patch only contains '+' lines or skippable lines.
+        # This is ambiguous. Where should they be inserted?
+        logging.error("✗ Hunk Failed: Patch contains no context (' ') or delete ('-') lines to match.")
+        logging.error("  -> Please add at least one context line (without +/-) to anchor the patch.")
+        return None
+
+    # 2. Find the anchor line in the target file.
+    target_idx = 0
+    modified_lines = []
+    found_anchor = False
+    
+    while target_idx < len(lines):
+        current_target_line = lines[target_idx]
+        norm_target_line = normalize(current_target_line, non_strict)
+        
+        if norm_target_line == norm_anchor_line:
+            found_anchor = True
+            logging.info(f"  -> Found anchor line at target line {target_idx + 1}: '{norm_anchor_line}'")
+            break # Found it!
+        
+        # This line isn't the anchor, so just copy it to the output
+        modified_lines.append(current_target_line)
+        target_idx += 1
+        
+    if not found_anchor:
+        logging.error(f"✗ Hunk Failed: Could not find anchor line in target file: '{norm_anchor_line}'")
+        return None
+
+    # 3. Now, apply the patch sequentially from this point.
+    # We must handle the anchor line itself, based on its op.
+    op_idx = anchor_op_index
     
     while op_idx < len(operations):
         op, patch_line = operations[op_idx]
+        norm_patch_line = normalize(patch_line, non_strict)
         
         if op == '+':
-            # ADD: Just add the line to our new list.
             modified_lines.append(patch_line)
             op_idx += 1
             continue
-        
-        # If we are here, op is ' ' or '-'.
-        # We must find a matching line in the target.
-        
-        # 1. Get the next meaningful patch line
-        norm_patch_line = normalize(patch_line, non_strict)
-        
-        # Skip this operation if it's not meaningful (e.g., a comment, .line)
-        if norm_patch_line is None:
+
+        # If we're here, op is ' ' or '-'.
+        if not norm_patch_line:
+            # Patch line is skippable (comment, .line, etc.)
+            # If it's context, we should probably add *something*...
+            # but it's safer to just skip it.
             op_idx += 1
             continue
         
-        # 2. Get the next meaningful target line
-        norm_target_line = None
+        # We have a meaningful ' ' or '-' line. Find its match in the target.
         while target_idx < len(lines):
-            norm_target_line = normalize(lines[target_idx], non_strict)
-            if norm_target_line is not None:
-                break  # Found a meaningful (non-directive) target line
+            current_target_line = lines[target_idx]
+            norm_target_line = normalize(current_target_line, non_strict)
             
-            # It was a skippable line, so add it to output and keep scanning
-            modified_lines.append(lines[target_idx])
-            target_idx += 1
-        
-        if target_idx == len(lines):
-            # We ran out of target lines to match against
-            logging.error(f"✗ Hunk Failed: Reached end of file while searching for: '{patch_line.strip()}'")
-            return None
+            if not norm_target_line:
+                # Target line is skippable.
+                # If patch op is context, we must add this skippable line.
+                if op == ' ':
+                    modified_lines.append(current_target_line)
+                target_idx += 1
+                continue # Keep scanning target
+            
+            # We have two meaningful lines. Compare them.
+            if norm_patch_line == norm_target_line:
+                # Match!
+                if op == ' ':
+                    # CONTEXT: Add the matching line
+                    modified_lines.append(current_target_line)
+                # if op == '-':
+                    # DELETE: Do *not* add the line.
+                
+                # Advance both pointers
+                target_idx += 1
+                op_idx += 1
+                break # Break from *inner* loop to get next op
+            else:
+                # Mismatch! The patch is out of sync.
+                logging.error(f"✗ Hunk Failed: Mismatch after anchor.")
+                logging.error(f"  Expected (normalized): '{norm_patch_line}' (from '{patch_line.strip()}')")
+                logging.error(f"  Got (normalized):      '{norm_target_line}' (from '{current_target_line.strip()}' at line {target_idx + 1})")
+                return None
+        else:
+            # We ran out of target lines while looking for a match
+            if op_idx < len(operations):
+                logging.error(f"✗ Hunk Failed: Reached end of file while searching for: '{patch_line.strip()}'")
+                return None
 
-        # 3. We have two meaningful, normalized lines. Compare them.
-        if norm_patch_line != norm_target_line:
-            logging.error(f"✗ Hunk Failed: Mismatch.")
-            logging.error(f"  Expected (normalized): '{norm_patch_line}' (from '{patch_line.strip()}')")
-            logging.error(f"  Got (normalized):      '{norm_target_line}' (from '{lines[target_idx].strip()}' at line {target_idx + 1})")
-            return None
-            
-        # 4. They match!
-        if op == ' ':
-            # CONTEXT: Add the *original* target line to the output
-            modified_lines.append(lines[target_idx])
-            target_idx += 1
-            op_idx += 1
-        elif op == '-':
-            # DELETE: *Don't* add the target line.
-            # Just advance both pointers.
-            target_idx += 1
-            op_idx += 1
-            
-    # We've applied all patch operations.
-    # Now, append any remaining lines from the original file.
+    # We've finished all operations. Add the rest of the file.
     modified_lines.extend(lines[target_idx:])
     
     return modified_lines
@@ -380,7 +423,7 @@ def show_diff(original: List[str], modified: List[str], filename: str):
             if line.startswith('+'):
                 logging.info(f"\033[92m{line}\033[0m")  # Green
             elif line.startswith('-'):
-                logging.info(f"\033[91m{line}\033[0m")  # Red
+                logging.info(f"\03S[91m{line}\033[0m")  # Red
             elif line.startswith('@@'):
                 logging.info(f"\033[96m{line}\033[0m")  # Cyan
             else:
