@@ -275,117 +275,96 @@ def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List
 
 def _apply_patch(lines: List[str], action: PatchAction, non_strict: bool) -> Optional[List[str]]:
     """
-    Applies a PATCH action robustly.
-    1. Finds the first meaningful anchor line from the patch.
-    2. Scans the target file to find that anchor.
-    3. Applies the rest of the patch sequentially from that point.
+    Applies a PATCH action robustly by matching the entire hunk context.
+    1. Extracts all context (' ') and delete ('-') lines into a 'fingerprint'.
+    2. Scans the target file to find a sequence of lines matching this fingerprint.
+    3. Once the correct location is found, it applies the full patch (adding '+'
+       lines and respecting '-' lines).
     """
-    
     operations = action['operations']
-    
-    # 1. Find the first meaningful context or delete line to anchor on.
-    anchor_op_index = -1
-    norm_anchor_line = None
-    for i, (op, line) in enumerate(operations):
-        if op == ' ' or op == '-': # '+' lines can't be anchors
+
+    # 1. Extract the 'fingerprint' to find: all context and delete lines.
+    fingerprint = []
+    for op, line in operations:
+        if op == ' ' or op == '-':
             norm_line = normalize(line, non_strict)
-            if norm_line: # Found our anchor
-                anchor_op_index = i
-                norm_anchor_line = norm_line
-                break
-    
-    if not norm_anchor_line:
-        # This patch only contains '+' lines or skippable lines.
-        # This is ambiguous. Where should they be inserted?
+            if norm_line: # Only add meaningful lines to the fingerprint
+                fingerprint.append(norm_line)
+
+    if not fingerprint:
         logging.error("✗ Hunk Failed: Patch contains no context (' ') or delete ('-') lines to match.")
         logging.error("  -> Please add at least one context line (without +/-) to anchor the patch.")
         return None
 
-    # 2. Find the anchor line in the target file.
-    target_idx = 0
-    modified_lines = []
-    found_anchor = False
-    
-    while target_idx < len(lines):
-        current_target_line = lines[target_idx]
-        norm_target_line = normalize(current_target_line, non_strict)
+    # 2. Scan the target file for the start of the fingerprint.
+    match_start_idx = -1
+    for i in range(len(lines)):
+        # Try to match the fingerprint starting at target line `i`
+        fingerprint_idx = 0
+        target_idx = i
         
-        if norm_target_line == norm_anchor_line:
-            found_anchor = True
-            logging.info(f"  -> Found anchor line at target line {target_idx + 1}: '{norm_anchor_line}'")
-            break # Found it!
+        while fingerprint_idx < len(fingerprint) and target_idx < len(lines):
+            norm_target_line = normalize(lines[target_idx], non_strict)
+            if not norm_target_line:
+                target_idx += 1 # Skip meaningless lines in target
+                continue
+
+            if norm_target_line == fingerprint[fingerprint_idx]:
+                # This line matches, advance both pointers
+                fingerprint_idx += 1
+                target_idx += 1
+            else:
+                # Mismatch, this wasn't the start of the hunk
+                break
         
-        # This line isn't the anchor, so just copy it to the output
-        modified_lines.append(current_target_line)
-        target_idx += 1
-        
-    if not found_anchor:
-        logging.error(f"✗ Hunk Failed: Could not find anchor line in target file: '{norm_anchor_line}'")
+        # If we matched all lines in the fingerprint
+        if fingerprint_idx == len(fingerprint):
+            logging.info(f"  -> Found matching hunk context starting at target line {i + 1}.")
+            match_start_idx = i
+            break # Found our spot
+
+    if match_start_idx == -1:
+        logging.error(f"✗ Hunk Failed: Could not find the required context sequence in the target file.")
+        logging.error(f"  -> Looking for (normalized): {fingerprint[0]}")
         return None
 
-    # 3. Now, apply the patch sequentially from this point.
-    # We must handle the anchor line itself, based on its op.
-    op_idx = anchor_op_index
-    
+    # 3. Now that we have the exact location, apply the patch.
+    modified_lines = lines[:match_start_idx]
+    op_idx = 0
+    target_idx = match_start_idx
+
     while op_idx < len(operations):
         op, patch_line = operations[op_idx]
-        norm_patch_line = normalize(patch_line, non_strict)
         
         if op == '+':
             modified_lines.append(patch_line)
             op_idx += 1
-            continue
+        elif op == ' ' or op == '-':
+            # We need to consume the corresponding line from the target to stay in sync
+            # Skip any meaningless lines in the target first.
+            while target_idx < len(lines) and not normalize(lines[target_idx], non_strict):
+                if op == ' ': # If context, preserve meaningless lines
+                    modified_lines.append(lines[target_idx])
+                target_idx += 1
 
-        # If we're here, op is ' ' or '-'.
-        if not norm_patch_line:
-            # Patch line is skippable (comment, .line, etc.)
-            # If it's context, we should probably add *something*...
-            # but it's safer to just skip it.
+            if target_idx >= len(lines):
+                logging.error(f"✗ Hunk Failed: Reached end of file unexpectedly while applying patch.")
+                return None
+            
+            # Now we are at a meaningful line.
+            if op == ' ': # Context line, so add the original from the file
+                modified_lines.append(lines[target_idx])
+
+            # For both ' ' and '-', we advance the target and op pointers.
+            # (For '-', we simply don't append the line, effectively deleting it)
+            target_idx += 1
             op_idx += 1
-            continue
-        
-        # We have a meaningful ' ' or '-' line. Find its match in the target.
-        while target_idx < len(lines):
-            current_target_line = lines[target_idx]
-            norm_target_line = normalize(current_target_line, non_strict)
-            
-            if not norm_target_line:
-                # Target line is skippable.
-                # If patch op is context, we must add this skippable line.
-                if op == ' ':
-                    modified_lines.append(current_target_line)
-                target_idx += 1
-                continue # Keep scanning target
-            
-            # We have two meaningful lines. Compare them.
-            if norm_patch_line == norm_target_line:
-                # Match!
-                if op == ' ':
-                    # CONTEXT: Add the matching line
-                    modified_lines.append(current_target_line)
-                # if op == '-':
-                    # DELETE: Do *not* add the line.
-                
-                # Advance both pointers
-                target_idx += 1
-                op_idx += 1
-                break # Break from *inner* loop to get next op
-            else:
-                # Mismatch! The patch is out of sync.
-                logging.error(f"✗ Hunk Failed: Mismatch after anchor.")
-                logging.error(f"  Expected (normalized): '{norm_patch_line}' (from '{patch_line.strip()}')")
-                logging.error(f"  Got (normalized):      '{norm_target_line}' (from '{current_target_line.strip()}' at line {target_idx + 1})")
-                return None
-        else:
-            # We ran out of target lines while looking for a match
-            if op_idx < len(operations):
-                logging.error(f"✗ Hunk Failed: Reached end of file while searching for: '{patch_line.strip()}'")
-                return None
-
-    # We've finished all operations. Add the rest of the file.
+    
+    # Add the rest of the file
     modified_lines.extend(lines[target_idx:])
     
     return modified_lines
+
 
 
 # --- Utility Functions (Unchanged) ---
