@@ -36,26 +36,18 @@ BLOCK_TERMINATORS = [
 
 def normalize(line: str, non_strict: bool = False) -> Optional[str]:
     """
-    Normalizes a smali line for robust comparison.
-
-    Returns:
-        A normalized string, or None if the line should be skipped entirely.
+    Normalizes a smali line for loose comparison.
+    Only trims whitespace and optionally generalizes registers.
+    Never skips directives, comments, or .line entries.
     """
-    line = line.strip()
+    # Remove leading/trailing whitespace and collapse inner spaces
+    line = re.sub(r'\s+', ' ', line.strip())
+    if line == "":
+        return None  # Skip only blank lines
     
-    # 1. Ignore comments, directives, and empty lines
-    if not line or line.startswith(('.line', '#', '.source', '.prologue', '.epilogue')):
-        return None  # This line is "skippable"
-        
-    # 2. Collapse all internal whitespace to a single space
-    line = re.sub(r'\s+', ' ', line)
-    
-    # 3. Handle non-strict register matching - BUT NOT LABELS!
     if non_strict:
-        # Only replace standalone register names like "v0", "p1" but NOT labels like ":cond_0"
-        # Use lookarounds to ensure we're not inside a label
-        line = re.sub(r'(?<!\:)\b([vp])\d+\b', r'\1X', line)
-    
+        # Replace registers like v0, v12, p1 → vX/pX, but not labels (:cond_0)
+        line = re.sub(r'(?<!:)\b([vp])\d+\b', r'\1X', line)
     return line
 
 # --- Parsing Logic (Unchanged) ---
@@ -275,96 +267,83 @@ def _apply_create_method(lines: List[str], action: PatchAction) -> Optional[List
 
 def _apply_patch(lines: List[str], action: PatchAction, non_strict: bool) -> Optional[List[str]]:
     """
-    Applies a PATCH action robustly by matching the entire hunk context.
-    1. Extracts all context (' ') and delete ('-') lines into a 'fingerprint'.
-    2. Scans the target file to find a sequence of lines matching this fingerprint.
-    3. Once the correct location is found, it applies the full patch (adding '+'
-       lines and respecting '-' lines).
+    Applies a PATCH action with full whitespace-insensitive matching.
+    - Works even if no context (' ') lines are provided.
+    - Ignores blank lines and spaces.
     """
     operations = action['operations']
 
-    # 1. Extract the 'fingerprint' to find: all context and delete lines.
-    fingerprint = []
-    for op, line in operations:
-        if op == ' ' or op == '-':
+    # Separate operations by type
+    context_ops = [(op, line) for op, line in operations if op in (' ', '-')]
+    add_ops = [(op, line) for op, line in operations if op == '+']
+
+    # If there are no context lines, apply '+'/'-' lines directly (global/simple mode)
+    if not context_ops:
+        logging.info("→ No context lines provided; applying add/remove globally (simple mode).")
+        modified = []
+        for line in lines:
             norm_line = normalize(line, non_strict)
-            if norm_line: # Only add meaningful lines to the fingerprint
-                fingerprint.append(norm_line)
-
-    if not fingerprint:
-        logging.error("✗ Hunk Failed: Patch contains no context (' ') or delete ('-') lines to match.")
-        logging.error("  -> Please add at least one context line (without +/-) to anchor the patch.")
-        return None
-
-    # 2. Scan the target file for the start of the fingerprint.
-    match_start_idx = -1
-    for i in range(len(lines)):
-        # Try to match the fingerprint starting at target line `i`
-        fingerprint_idx = 0
-        target_idx = i
-        
-        while fingerprint_idx < len(fingerprint) and target_idx < len(lines):
-            norm_target_line = normalize(lines[target_idx], non_strict)
-            if not norm_target_line:
-                target_idx += 1 # Skip meaningless lines in target
+            if not norm_line:
+                modified.append(line)
                 continue
 
-            if norm_target_line == fingerprint[fingerprint_idx]:
-                # This line matches, advance both pointers
-                fingerprint_idx += 1
-                target_idx += 1
+            # Delete matching '-' lines if found
+            if any(normalize(l, non_strict) == norm_line for _, l in operations if _ == '-'):
+                continue  # skip this line (deleted)
+            modified.append(line)
+        # Append '+' lines at the end
+        modified.extend([l for _, l in add_ops])
+        return modified
+
+    # Otherwise, use context-based hunk application
+    fingerprint = [normalize(line, non_strict)
+                   for op, line in context_ops
+                   if normalize(line, non_strict)]
+
+    match_start_idx = -1
+    for i in range(len(lines)):
+        # Match fingerprint ignoring blank lines and whitespace
+        fi, li = 0, i
+        while fi < len(fingerprint) and li < len(lines):
+            norm_target = normalize(lines[li], non_strict)
+            if norm_target is None:
+                li += 1
+                continue
+            if norm_target == fingerprint[fi]:
+                fi += 1
+                li += 1
             else:
-                # Mismatch, this wasn't the start of the hunk
                 break
-        
-        # If we matched all lines in the fingerprint
-        if fingerprint_idx == len(fingerprint):
-            logging.info(f"  -> Found matching hunk context starting at target line {i + 1}.")
+        if fi == len(fingerprint):
             match_start_idx = i
-            break # Found our spot
+            break
 
     if match_start_idx == -1:
-        logging.error(f"✗ Hunk Failed: Could not find the required context sequence in the target file.")
-        logging.error(f"  -> Looking for (normalized): {fingerprint[0]}")
+        logging.error("✗ Hunk Failed: Could not find context match in target.")
         return None
 
-    # 3. Now that we have the exact location, apply the patch.
-    modified_lines = lines[:match_start_idx]
-    op_idx = 0
-    target_idx = match_start_idx
+    logging.info(f"  -> Context match found at line {match_start_idx+1}.")
+
+    modified = lines[:match_start_idx]
+    op_idx, li = 0, match_start_idx
 
     while op_idx < len(operations):
         op, patch_line = operations[op_idx]
-        
         if op == '+':
-            modified_lines.append(patch_line)
-            op_idx += 1
-        elif op == ' ' or op == '-':
-            # We need to consume the corresponding line from the target to stay in sync
-            # Skip any meaningless lines in the target first.
-            while target_idx < len(lines) and not normalize(lines[target_idx], non_strict):
-                if op == ' ': # If context, preserve meaningless lines
-                    modified_lines.append(lines[target_idx])
-                target_idx += 1
+            modified.append(patch_line)
+        elif op in (' ', '-'):
+            # Skip blank lines but keep structure for ' ' lines
+            while li < len(lines) and normalize(lines[li], non_strict) is None:
+                modified.append(lines[li])
+                li += 1
+            if li < len(lines):
+                if op == ' ':
+                    modified.append(lines[li])
+                li += 1
+        op_idx += 1
 
-            if target_idx >= len(lines):
-                logging.error(f"✗ Hunk Failed: Reached end of file unexpectedly while applying patch.")
-                return None
-            
-            # Now we are at a meaningful line.
-            if op == ' ': # Context line, so add the original from the file
-                modified_lines.append(lines[target_idx])
-
-            # For both ' ' and '-', we advance the target and op pointers.
-            # (For '-', we simply don't append the line, effectively deleting it)
-            target_idx += 1
-            op_idx += 1
-    
-    # Add the rest of the file
-    modified_lines.extend(lines[target_idx:])
-    
-    return modified_lines
-
+    modified.extend(lines[li:])
+    return modified
 
 
 # --- Utility Functions (Unchanged) ---
